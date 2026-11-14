@@ -1,0 +1,68 @@
+diff --git a/wechat_bridge/serve.py b/wechat_bridge/serve.py
+index 84f4d54..2aa9c92 100644
+--- a/wechat_bridge/serve.py
++++ b/wechat_bridge/serve.py
+@@ -1,9 +1,13 @@
+ """常驻服务：长轮询收消息 → inbox/；outbox/pending/ → sendmessage 发出。
+ 
+ 指数退避：失败 2 秒重试，连续 3 次失败后退避到 30 秒（学 wx-bot）。
++
++本地改动（2026-10-11）：outbox 发送改为独立守护线程每 5 秒 flush 一次，
++不再等 getupdates 长轮询（45s）返回才发，解决回复延迟问题。
+ """
+ 
+ import os
++import threading
+ import time
+ 
+ from .ilink import (
+@@ -150,6 +154,22 @@ def flush_outbox(store, baseurl, token):
+     return True
+ 
+ 
++def _flush_loop(store, baseurl, token, stop_event):
++    """独立线程：每 5 秒把 outbox/pending/ 里的回复发出去。
++
++    原来 flush 只在 getupdates 长轮询返回后执行一次（最长 45 秒），
++    回复延迟太大。单线程顺序发送，避免与主循环重复发送。
++    """
++    while not stop_event.wait(5):
++        if os.path.exists(store.needs_relogin_path):
++            return
++        try:
++            if not flush_outbox(store, baseurl, token):
++                return  # token 失效，flush_outbox 内已写 NEEDS_RELOGIN
++        except Exception as e:
++            print("outbox flush 线程出错: %s" % e, flush=True)
++
++
+ def run(store, baseurl, token, owner_id):
+     """常驻收发主循环。返回 0 正常退出，1 异常退出。"""
+     atomic_write_text(store.pid_path, str(os.getpid()))
+@@ -160,6 +180,11 @@ def run(store, baseurl, token, owner_id):
+     print("serve 启动，监听用户 %s 的消息…" % owner_id, flush=True)
+     consec_failures = 0
+     poll_timeout = 45
++    stop_event = threading.Event()
++    flush_thread = threading.Thread(target=_flush_loop,
++                                    args=(store, baseurl, token, stop_event),
++                                    daemon=True)
++    flush_thread.start()
+     try:
+         while True:
+             if os.path.exists(store.needs_relogin_path):
+@@ -206,12 +231,12 @@ def run(store, baseurl, token, owner_id):
+                     handle_incoming(store, msg, owner_id)
+                 except Exception as e:
+                     print("处理消息出错: %s" % e, flush=True)
+-            if not flush_outbox(store, baseurl, token):
+-                return 1
++            # outbox 发送由独立 flush 线程负责（每 5 秒），主循环不再调用
+     except KeyboardInterrupt:
+         print("收到中断，退出 serve。", flush=True)
+         return 0
+     finally:
++        stop_event.set()
+         try:
+             os.remove(store.pid_path)
+         except OSError:
